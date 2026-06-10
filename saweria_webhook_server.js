@@ -1,102 +1,96 @@
 /**
  * ============================================================
- *  SAWERIA → ROBLOX DONATION BRIDGE
+ *  SAWERIA → ROBLOX DONATION BRIDGE (Cookie Auth)
  *  Author  : untuk Kai (Map ID: 10292270321)
  *  Stack   : Node.js (Express)
- *  Deploy  : Railway / Render / VPS
+ *  Deploy  : Railway
  * ============================================================
  *
- *  SETUP:
- *  1. npm install express crypto axios
- *  2. Isi ENV variable berikut (di Railway/Render cukup via dashboard):
- *       SAWERIA_STREAM_KEY   = Stream Key dari dashboard Saweria kamu
- *       ROBLOX_API_KEY       = Open Cloud API Key dari roblox.com/create/credentials
- *       ROBLOX_UNIVERSE_ID   = Universe ID game kamu
- *       ROBLOX_DATASTORE     = SaweriaDonatV1   (harus sama dengan script Roblox)
- *       PORT                 = 3000 (opsional, default 3000)
- *
- *  3. Di dashboard Saweria → Stream Settings → Webhook URL:
- *       https://<domain-kamu>/saweria-webhook
+ *  ENV Variables yang dibutuhkan:
+ *    ROBLOSECURITY   = Cookie .ROBLOSECURITY dari browser Roblox kamu
+ *    ROBLOX_UNIVERSE_ID = Universe ID game kamu
+ *    ROBLOX_DATASTORE   = SaweriaDonatV1
+ *    SAWERIA_STREAM_KEY = (opsional) Stream Key Saweria
  * ============================================================
  */
 
-const express   = require("express");
-const crypto    = require("crypto");
-const axios     = require("axios");
+const express = require("express");
+const crypto  = require("crypto");
+const axios   = require("axios");
 
-const app  = express();
+const app = express();
 app.use(express.json());
 
 // ── ENV ──────────────────────────────────────────────────────
-const SAWERIA_STREAM_KEY  = process.env.SAWERIA_STREAM_KEY  || "";
-const ROBLOX_API_KEY      = process.env.ROBLOX_API_KEY      || "";
-const ROBLOX_UNIVERSE_ID  = process.env.ROBLOX_UNIVERSE_ID  || "";
-const ROBLOX_DATASTORE    = process.env.ROBLOX_DATASTORE    || "SaweriaDonatV1";
-const PORT                = process.env.PORT                || 3000;
+const ROBLOSECURITY      = process.env.ROBLOSECURITY      || "";
+const ROBLOX_UNIVERSE_ID = process.env.ROBLOX_UNIVERSE_ID || "";
+const ROBLOX_DATASTORE   = process.env.ROBLOX_DATASTORE   || "SaweriaDonatV1";
+const SAWERIA_STREAM_KEY = process.env.SAWERIA_STREAM_KEY  || "";
+const PORT               = process.env.PORT               || 3000;
 
-// ── SIGNATURE VERIFICATION ───────────────────────────────────
-/**
- * Saweria mengirim header "x-saweria-token" berisi HMAC-SHA256
- * dari raw body menggunakan Stream Key sebagai secret.
- * Kalau kamu tidak menemukan header ini, hapus middleware ini.
- */
-function verifySaweria(req, res, next) {
-  if (!SAWERIA_STREAM_KEY) return next(); // skip jika key tidak diset
+// ── CSRF TOKEN CACHE ─────────────────────────────────────────
+let csrfToken = "";
 
-  const signature = req.headers["x-saweria-token"] || "";
-  const hmac = crypto
-    .createHmac("sha256", SAWERIA_STREAM_KEY)
-    .update(JSON.stringify(req.body))
-    .digest("hex");
-
-  if (signature !== hmac) {
-    console.warn("[WARN] Signature tidak cocok — request ditolak");
-    return res.status(401).json({ error: "Unauthorized" });
+async function fetchCsrfToken() {
+  try {
+    await axios.post("https://auth.roblox.com/v2/logout", {}, {
+      headers: { Cookie: `.ROBLOSECURITY=${ROBLOSECURITY}` }
+    });
+  } catch (err) {
+    const token = err.response?.headers?.["x-csrf-token"];
+    if (token) {
+      csrfToken = token;
+      console.log("[CSRF] Token diperbarui:", csrfToken.substring(0, 8) + "...");
+    }
   }
-  next();
 }
 
-// ── ROBLOX OPEN CLOUD HELPER ─────────────────────────────────
-const ROBLOX_BASE = "https://apis.roblox.com/datastores/v1";
+// ── ROBLOX DATASTORE HELPERS ─────────────────────────────────
+const DS_BASE = `https://apis.roblox.com/datastores/v1/universes/${ROBLOX_UNIVERSE_ID}/standard-datastores/datastore/entries/entry`;
 
-/**
- * Ambil nilai DataStore key saat ini.
- * Return: angka (amount) atau 0 jika belum ada.
- */
+function robloxHeaders() {
+  return {
+    "Cookie"       : `.ROBLOSECURITY=${ROBLOSECURITY}`,
+    "x-csrf-token" : csrfToken,
+    "Content-Type" : "application/json"
+  };
+}
+
 async function getDataStoreValue(key) {
   try {
-    const url = `${ROBLOX_BASE}/universes/${ROBLOX_UNIVERSE_ID}/standard-datastores/datastore/entries/entry`;
-    const res = await axios.get(url, {
-      params: { datastoreName: ROBLOX_DATASTORE, entryKey: key },
-      headers: { "x-api-key": ROBLOX_API_KEY }
+    const res = await axios.get(DS_BASE, {
+      params : { datastoreName: ROBLOX_DATASTORE, entryKey: key },
+      headers: robloxHeaders()
     });
     return Number(res.data) || 0;
   } catch (err) {
-    if (err.response?.status === 404) return 0; // key belum ada
+    if (err.response?.status === 404) return 0;
     throw err;
   }
 }
 
-/**
- * Set nilai DataStore key.
- * Roblox Open Cloud butuh body = JSON string dari value.
- */
 async function setDataStoreValue(key, value) {
-  const url = `${ROBLOX_BASE}/universes/${ROBLOX_UNIVERSE_ID}/standard-datastores/datastore/entries/entry`;
-  await axios.post(url, JSON.stringify(value), {
-    params: { datastoreName: ROBLOX_DATASTORE, entryKey: key },
-    headers: {
-      "x-api-key"    : ROBLOX_API_KEY,
-      "Content-Type" : "application/json"
+  try {
+    await axios.post(DS_BASE, JSON.stringify(value), {
+      params : { datastoreName: ROBLOX_DATASTORE, entryKey: key },
+      headers: robloxHeaders()
+    });
+  } catch (err) {
+    // Kalau CSRF expired, refresh dan coba lagi sekali
+    if (err.response?.status === 403) {
+      console.log("[CSRF] Token expired, refresh...");
+      await fetchCsrfToken();
+      await axios.post(DS_BASE, JSON.stringify(value), {
+        params : { datastoreName: ROBLOX_DATASTORE, entryKey: key },
+        headers: robloxHeaders()
+      });
+    } else {
+      throw err;
     }
-  });
+  }
 }
 
-// ── NORMALISASI NAMA ─────────────────────────────────────────
-/**
- * Saweria bisa mengirim nama donatur dalam berbagai bentuk.
- * Kita sanitasi jadi slug yang aman untuk DataStore key.
- */
+// ── SANITIZE NAME ─────────────────────────────────────────────
 function sanitizeName(rawName) {
   return (rawName || "anonymous")
     .trim()
@@ -104,58 +98,52 @@ function sanitizeName(rawName) {
     .substring(0, 48);
 }
 
-// ── ENDPOINT: HEALTH CHECK ───────────────────────────────────
+// ── SAWERIA SIGNATURE VERIFY ──────────────────────────────────
+function verifySaweria(req, res, next) {
+  if (!SAWERIA_STREAM_KEY) return next();
+  const signature = req.headers["x-saweria-token"] || "";
+  const hmac = crypto
+    .createHmac("sha256", SAWERIA_STREAM_KEY)
+    .update(JSON.stringify(req.body))
+    .digest("hex");
+  if (signature !== hmac) {
+    console.warn("[WARN] Signature tidak cocok");
+    return res.status(401).json({ error: "Unauthorized" });
+  }
+  next();
+}
+
+// ── ENDPOINTS ─────────────────────────────────────────────────
 app.get("/", (_req, res) => {
-  res.json({ status: "ok", service: "saweria-roblox-bridge" });
+  res.json({ status: "ok", service: "saweria-roblox-bridge-cookie" });
 });
 
-// ── ENDPOINT: SAWERIA WEBHOOK ────────────────────────────────
 app.post("/saweria-webhook", verifySaweria, async (req, res) => {
   try {
-    const body = req.body;
-    console.log("[WEBHOOK] Payload diterima:", JSON.stringify(body));
+    const body    = req.body;
+    console.log("[WEBHOOK] Payload:", JSON.stringify(body));
 
-    /*
-     * Struktur payload Saweria (berdasarkan dokumentasi resmi):
-     * {
-     *   "type"       : "donations",   // atau "superchats"
-     *   "data"       : {
-     *     "donator"  : "NamaDonatur",
-     *     "amount"   : 50000,
-     *     "message"  : "...",
-     *     "currency" : "IDR"
-     *   }
-     * }
-     * Referensi: https://saweria.co/developers (Stream Key section)
-     */
-
-    const type    = body?.type || "";
-    const data    = body?.data || body;  // fallback kalau struktur berbeda
+    const data    = body?.data || body;
     const rawName = data?.donator || data?.name || data?.username || "anonymous";
     const amount  = Number(data?.amount) || 0;
 
-    if (amount <= 0) {
-      console.log("[SKIP] Amount 0 atau tidak valid, skip.");
-      return res.json({ ok: true, skipped: true });
-    }
+    if (amount <= 0) return res.json({ ok: true, skipped: true });
 
-    const key        = `user_${sanitizeName(rawName)}`;
-    const current    = await getDataStoreValue(key);
-    const newAmount  = current + amount;
+    const key       = `user_${sanitizeName(rawName)}`;
+    const current   = await getDataStoreValue(key);
+    const newAmount = current + amount;
 
     await setDataStoreValue(key, newAmount);
-
-    console.log(`[OK] ${key} | sebelum: ${current} | tambah: ${amount} | total: ${newAmount}`);
+    console.log(`[OK] ${key} | +${amount} | total: ${newAmount}`);
     res.json({ ok: true, key, amount, total: newAmount });
 
   } catch (err) {
-    console.error("[ERROR] Webhook handler:", err.response?.data || err.message);
+    console.error("[ERROR] Webhook:", err.response?.data || err.message);
     res.status(500).json({ error: "Internal server error" });
   }
 });
 
-// ── ENDPOINT: MANUAL TEST ────────────────────────────────────
-// POST /test-donation  body: { "name": "TestUser", "amount": 10000 }
+// POST /test-donation  { "name": "TestUser", "amount": 50000 }
 app.post("/test-donation", async (req, res) => {
   try {
     const { name = "TestUser", amount = 10000 } = req.body;
@@ -166,13 +154,15 @@ app.post("/test-donation", async (req, res) => {
     console.log(`[TEST] ${key} → total: ${newAmount}`);
     res.json({ ok: true, key, amount, total: newAmount });
   } catch (err) {
+    console.error("[ERROR] Test:", err.response?.data || err.message);
     res.status(500).json({ error: err.response?.data || err.message });
   }
 });
 
-// ── START ─────────────────────────────────────────────────────
-app.listen(PORT, () => {
-  console.log(`[START] Saweria-Roblox Bridge running on port ${PORT}`);
-  if (!SAWERIA_STREAM_KEY) console.warn("[WARN] SAWERIA_STREAM_KEY tidak diset — verifikasi signature dinonaktifkan");
-  if (!ROBLOX_API_KEY)     console.warn("[WARN] ROBLOX_API_KEY tidak diset — DataStore write akan gagal");
+// ── START ──────────────────────────────────────────────────────
+app.listen(PORT, async () => {
+  console.log(`[START] Saweria-Roblox Bridge (cookie) on port ${PORT}`);
+  if (!ROBLOSECURITY)      console.warn("[WARN] ROBLOSECURITY tidak diset!");
+  if (!ROBLOX_UNIVERSE_ID) console.warn("[WARN] ROBLOX_UNIVERSE_ID tidak diset!");
+  await fetchCsrfToken();
 });
