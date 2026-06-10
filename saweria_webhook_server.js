@@ -1,101 +1,49 @@
 /**
  * ============================================================
- *  SAWERIA → ROBLOX DONATION BRIDGE (Cookie Auth)
- *  Author  : untuk Kai (Map ID: 10292270321)
- *  Stack   : Node.js (Express)
- *  Deploy  : Railway
+ *  SAWERIA → ROBLOX DONATION BRIDGE (Final)
+ *  Arsitektur: Saweria → Railway (simpan di memory) → Roblox polling
+ *  Deploy: Railway
  * ============================================================
  *
- *  ENV Variables yang dibutuhkan:
- *    ROBLOSECURITY   = Cookie .ROBLOSECURITY dari browser Roblox kamu
- *    ROBLOX_UNIVERSE_ID = Universe ID game kamu
- *    ROBLOX_DATASTORE   = SaweriaDonatV1
- *    SAWERIA_STREAM_KEY = (opsional) Stream Key Saweria
+ *  ENV Variables:
+ *    SAWERIA_STREAM_KEY = Stream Key Saweria (opsional, untuk verifikasi)
+ *    SECRET_KEY         = Kunci rahasia bebas, misal: "kunci123"
+ *                         (dipakai Roblox Script untuk autentikasi polling)
  * ============================================================
  */
 
 const express = require("express");
 const crypto  = require("crypto");
-const axios   = require("axios");
 
 const app = express();
 app.use(express.json());
 
-// ── ENV ──────────────────────────────────────────────────────
-const ROBLOSECURITY      = process.env.ROBLOSECURITY      || "";
-const ROBLOX_UNIVERSE_ID = process.env.ROBLOX_UNIVERSE_ID || "";
-const ROBLOX_DATASTORE   = process.env.ROBLOX_DATASTORE   || "SaweriaDonatV1";
-const SAWERIA_STREAM_KEY = process.env.SAWERIA_STREAM_KEY  || "";
+// ── ENV ───────────────────────────────────────────────────────
+const SAWERIA_STREAM_KEY = process.env.SAWERIA_STREAM_KEY || "";
+const SECRET_KEY         = process.env.SECRET_KEY         || "rahasia123";
 const PORT               = process.env.PORT               || 3000;
 
-// ── CSRF TOKEN CACHE ─────────────────────────────────────────
-let csrfToken = "";
+// ── STORAGE (in-memory) ───────────────────────────────────────
+// { "NamaDonatur": totalAmount }
+const donations = {};
 
-async function fetchCsrfToken() {
-  try {
-    await axios.post("https://auth.roblox.com/v2/logout", {}, {
-      headers: { Cookie: `.ROBLOSECURITY=${ROBLOSECURITY}` }
-    });
-  } catch (err) {
-    const token = err.response?.headers?.["x-csrf-token"];
-    if (token) {
-      csrfToken = token;
-      console.log("[CSRF] Token diperbarui:", csrfToken.substring(0, 8) + "...");
-    }
-  }
-}
+// Antrian donasi baru yang belum diambil Roblox
+// [ { name, amount, timestamp } ]
+const pendingQueue = [];
 
-// ── ROBLOX DATASTORE HELPERS ─────────────────────────────────
-const DS_BASE = `https://apis.roblox.com/datastores/v1/universes/${ROBLOX_UNIVERSE_ID}/standard-datastores/datastore/entries/entry`;
-
-function robloxHeaders() {
-  return {
-    "Cookie"       : `.ROBLOSECURITY=${ROBLOSECURITY}`,
-    "x-csrf-token" : csrfToken,
-    "Content-Type" : "application/json"
-  };
-}
-
-async function getDataStoreValue(key) {
-  try {
-    const res = await axios.get(DS_BASE, {
-      params : { datastoreName: ROBLOX_DATASTORE, entryKey: key },
-      headers: robloxHeaders()
-    });
-    return Number(res.data) || 0;
-  } catch (err) {
-    if (err.response?.status === 404) return 0;
-    throw err;
-  }
-}
-
-async function setDataStoreValue(key, value) {
-  try {
-    await axios.post(DS_BASE, JSON.stringify(value), {
-      params : { datastoreName: ROBLOX_DATASTORE, entryKey: key },
-      headers: robloxHeaders()
-    });
-  } catch (err) {
-    // Kalau CSRF expired, refresh dan coba lagi sekali
-    if (err.response?.status === 403) {
-      console.log("[CSRF] Token expired, refresh...");
-      await fetchCsrfToken();
-      await axios.post(DS_BASE, JSON.stringify(value), {
-        params : { datastoreName: ROBLOX_DATASTORE, entryKey: key },
-        headers: robloxHeaders()
-      });
-    } else {
-      throw err;
-    }
-  }
-}
-
-// ── SANITIZE NAME ─────────────────────────────────────────────
-function sanitizeName(rawName) {
-  return (rawName || "anonymous")
+// ── HELPERS ───────────────────────────────────────────────────
+function sanitizeName(raw) {
+  return (raw || "anonymous")
     .trim()
     .replace(/[^a-zA-Z0-9_\-\.]/g, "_")
     .substring(0, 48);
+}
+
+function addDonation(rawName, amount) {
+  const name = sanitizeName(rawName);
+  donations[name] = (donations[name] || 0) + amount;
+  pendingQueue.push({ name, amount, timestamp: Date.now() });
+  console.log(`[DONAT] ${name} +${amount} | total: ${donations[name]}`);
 }
 
 // ── SAWERIA SIGNATURE VERIFY ──────────────────────────────────
@@ -107,62 +55,69 @@ function verifySaweria(req, res, next) {
     .update(JSON.stringify(req.body))
     .digest("hex");
   if (signature !== hmac) {
-    console.warn("[WARN] Signature tidak cocok");
+    console.warn("[WARN] Signature Saweria tidak cocok");
     return res.status(401).json({ error: "Unauthorized" });
   }
   next();
 }
 
-// ── ENDPOINTS ─────────────────────────────────────────────────
+// ── ENDPOINT: Health Check ────────────────────────────────────
 app.get("/", (_req, res) => {
-  res.json({ status: "ok", service: "saweria-roblox-bridge-cookie" });
+  res.json({ status: "ok", service: "saweria-roblox-bridge-v2" });
 });
 
-app.post("/saweria-webhook", verifySaweria, async (req, res) => {
-  try {
-    const body    = req.body;
-    console.log("[WEBHOOK] Payload:", JSON.stringify(body));
+// ── ENDPOINT: Saweria Webhook ─────────────────────────────────
+// Saweria POST ke sini setiap ada donasi masuk
+app.post("/saweria-webhook", verifySaweria, (req, res) => {
+  const body    = req.body;
+  const data    = body?.data || body;
+  const rawName = data?.donator || data?.name || data?.username || "anonymous";
+  const amount  = Number(data?.amount) || 0;
 
-    const data    = body?.data || body;
-    const rawName = data?.donator || data?.name || data?.username || "anonymous";
-    const amount  = Number(data?.amount) || 0;
+  console.log("[WEBHOOK] Diterima:", JSON.stringify(body));
 
-    if (amount <= 0) return res.json({ ok: true, skipped: true });
+  if (amount <= 0) return res.json({ ok: true, skipped: true });
 
-    const key       = `user_${sanitizeName(rawName)}`;
-    const current   = await getDataStoreValue(key);
-    const newAmount = current + amount;
-
-    await setDataStoreValue(key, newAmount);
-    console.log(`[OK] ${key} | +${amount} | total: ${newAmount}`);
-    res.json({ ok: true, key, amount, total: newAmount });
-
-  } catch (err) {
-    console.error("[ERROR] Webhook:", err.response?.data || err.message);
-    res.status(500).json({ error: "Internal server error" });
-  }
+  addDonation(rawName, amount);
+  res.json({ ok: true });
 });
 
-// POST /test-donation  { "name": "TestUser", "amount": 50000 }
-app.post("/test-donation", async (req, res) => {
-  try {
-    const { name = "TestUser", amount = 10000 } = req.body;
-    const key       = `user_${sanitizeName(name)}`;
-    const current   = await getDataStoreValue(key);
-    const newAmount = current + Number(amount);
-    await setDataStoreValue(key, newAmount);
-    console.log(`[TEST] ${key} → total: ${newAmount}`);
-    res.json({ ok: true, key, amount, total: newAmount });
-  } catch (err) {
-    console.error("[ERROR] Test:", err.response?.data || err.message);
-    res.status(500).json({ error: err.response?.data || err.message });
+// ── ENDPOINT: Roblox Polling - Ambil semua donasi ─────────────
+// Roblox Script GET /donations?key=SECRET_KEY
+// Return: { donations: { "Nama": total, ... } }
+app.get("/donations", (req, res) => {
+  if (req.query.key !== SECRET_KEY) {
+    return res.status(401).json({ error: "Unauthorized" });
   }
+  res.json({ donations });
+});
+
+// ── ENDPOINT: Roblox Polling - Ambil antrian pending ─────────
+// Roblox GET /pending?key=SECRET_KEY
+// Return array donasi baru, lalu queue dikosongkan
+app.get("/pending", (req, res) => {
+  if (req.query.key !== SECRET_KEY) {
+    return res.status(401).json({ error: "Unauthorized" });
+  }
+  const queue = [...pendingQueue];
+  pendingQueue.length = 0; // kosongkan setelah diambil
+  res.json({ queue });
+});
+
+// ── ENDPOINT: Manual Test ─────────────────────────────────────
+// POST /test-donation { "name": "TestUser", "amount": 50000, "key": "SECRET_KEY" }
+app.post("/test-donation", (req, res) => {
+  const { name = "TestUser", amount = 10000, key } = req.body;
+  if (key !== SECRET_KEY) {
+    return res.status(401).json({ error: "Unauthorized" });
+  }
+  addDonation(name, Number(amount));
+  res.json({ ok: true, donations });
 });
 
 // ── START ──────────────────────────────────────────────────────
-app.listen(PORT, async () => {
-  console.log(`[START] Saweria-Roblox Bridge (cookie) on port ${PORT}`);
-  if (!ROBLOSECURITY)      console.warn("[WARN] ROBLOSECURITY tidak diset!");
-  if (!ROBLOX_UNIVERSE_ID) console.warn("[WARN] ROBLOX_UNIVERSE_ID tidak diset!");
-  await fetchCsrfToken();
+app.listen(PORT, () => {
+  console.log(`[START] Saweria Bridge v2 on port ${PORT}`);
+  console.log(`[INFO]  SECRET_KEY: ${SECRET_KEY.substring(0, 4)}****`);
+  if (!SAWERIA_STREAM_KEY) console.warn("[WARN] SAWERIA_STREAM_KEY tidak diset — verifikasi dinonaktifkan");
 });
